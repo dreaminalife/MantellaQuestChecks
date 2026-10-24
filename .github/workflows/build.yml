@@ -1,0 +1,41 @@
+name: Build
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: xmake-io/github-action-setup-xmake@v1
+        with:
+          xmake-version: latest
+          actions-cache-folder: .xmake-cache
+
+      # CommonLib is pinned to a release tag, so its xmake script downloads the prebuilt library
+      # instead of compiling it. Cache the download and xmake's packages (spdlog etc.) between runs
+      - uses: actions/cache@v4
+        with:
+          path: |
+            lib/commonlibsse-ng/build/.prebuilt
+            ~/AppData/Local/.xmake/packages
+          key: deps-${{ hashFiles('.gitmodules', 'xmake.lua') }}-${{ github.sha }}
+          restore-keys: deps-${{ hashFiles('.gitmodules', 'xmake.lua') }}-
+
+      - name: Build
+        run: |
+          xmake config --yes --mode=releasedbg
+          xmake build --yes
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MantellaQuestChecks
+          path: |
+            build/windows/x64/releasedbg/MantellaQuestChecks.dll
+            build/windows/x64/releasedbg/MantellaQuestChecks.pdb
+          if-no-files-found: error
