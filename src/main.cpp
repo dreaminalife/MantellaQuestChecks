@@ -176,7 +176,8 @@ namespace
 
 		RE::TESForm* form = nullptr;
 		if (const auto status = LookupForm(a_value, form); status != Status::kOK) {
-			return status;
+			// Only placed NPCs leave memory. Base NPCs, factions, places etc. are always loaded, so not finding one is a wrong ID
+			return status == Status::kNotLoaded && a_kind != Kind::kActor ? Status::kMissing : status;
 		}
 		// The wrong kind of form means a mistake in the condition: not true
 		switch (a_kind) {
