@@ -57,6 +57,34 @@ namespace
 		{ "hasspell"sv, "HasSpell"sv, true, Kind::kActor, Kind::kSpell },
 	};
 
+	// The skill names Mantella sends, lowercase (ParseValue lowercases them: Papyrus may hand strings over in another case)
+	struct Skill
+	{
+		std::string_view name;
+		RE::ActorValue   actorValue;
+	};
+
+	constexpr Skill kSkills[] = {
+		{ "onehanded"sv, RE::ActorValue::kOneHanded },
+		{ "twohanded"sv, RE::ActorValue::kTwoHanded },
+		{ "marksman"sv, RE::ActorValue::kArchery },
+		{ "block"sv, RE::ActorValue::kBlock },
+		{ "smithing"sv, RE::ActorValue::kSmithing },
+		{ "heavyarmor"sv, RE::ActorValue::kHeavyArmor },
+		{ "lightarmor"sv, RE::ActorValue::kLightArmor },
+		{ "pickpocket"sv, RE::ActorValue::kPickpocket },
+		{ "lockpicking"sv, RE::ActorValue::kLockpicking },
+		{ "sneak"sv, RE::ActorValue::kSneak },
+		{ "alchemy"sv, RE::ActorValue::kAlchemy },
+		{ "speechcraft"sv, RE::ActorValue::kSpeech },
+		{ "alteration"sv, RE::ActorValue::kAlteration },
+		{ "conjuration"sv, RE::ActorValue::kConjuration },
+		{ "destruction"sv, RE::ActorValue::kDestruction },
+		{ "illusion"sv, RE::ActorValue::kIllusion },
+		{ "restoration"sv, RE::ActorValue::kRestoration },
+		{ "enchanting"sv, RE::ActorValue::kEnchanting },
+	};
+
 	// A subject or argument as Mantella sends it: "player", "File.esm|0D7505", a quest editor ID, a number or a skill name
 	struct Value
 	{
@@ -150,15 +178,13 @@ namespace
 			return Status::kOK;
 		case Kind::kActorValue:
 			{
-				// Compared without case: Papyrus may hand strings over in another case than Mantella sent them
-				for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(RE::ActorValue::kTotal); ++i) {
-					const char* name = RE::ActorValueList::GetActorValueName(static_cast<RE::ActorValue>(i));
-					if (name && ToLower(name) == a_value.text) {
-						a_param = reinterpret_cast<void*>(static_cast<std::uintptr_t>(i));
-						return Status::kOK;
-					}
+				// A fixed table: the game's own name lookup doesn't know names like OneHanded or Marksman
+				const auto skill = std::ranges::find(kSkills, std::string_view(a_value.text), &Skill::name);
+				if (skill == std::ranges::end(kSkills)) {
+					return Status::kMissing;
 				}
-				return Status::kMissing;
+				a_param = reinterpret_cast<void*>(static_cast<std::uintptr_t>(skill->actorValue));
+				return Status::kOK;
 			}
 		case Kind::kQuest:
 			{
