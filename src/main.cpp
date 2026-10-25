@@ -5,59 +5,22 @@
 // and every player line. This plugin only answers each check with a plain number: comparing,
 // combining and deciding what NPCs are told all happens in Mantella.
 //
-// Each check runs the game's own condition function (the one quest dialogue conditions use), so
-// the answers match what the console shows.
+// Each check runs one of the game's own condition functions (the ones quest dialogue conditions use),
+// so the answers match what the console shows. Any condition function can be asked: the game's command
+// table says what kind of value each one takes, and the values are read accordingly.
 
 namespace
 {
 	// Reserved answers, the same values as Mantella's src/quest_tags/conditions.py
-	constexpr float kAnswerMissing = -9999901.0f;    // What the check is about doesn't exist in this game: not true
-	constexpr float kAnswerNotLoaded = -9999902.0f;  // Exists, but isn't in memory right now (e.g. an NPC far away): unknown
+	constexpr float kAnswerMissing = -9999901.0f;     // What the check is about doesn't exist in this game: not true
+	constexpr float kAnswerNotLoaded = -9999902.0f;   // Exists, but isn't in memory right now (e.g. an NPC far away): unknown
+	constexpr float kAnswerUnreadable = -9999903.0f;  // The check can't be run (unknown function, wrong values): not true
 
-	enum class Kind
-	{
-		kNone,
-		kQuest,       // Editor ID
-		kInt,         // A quest stage
-		kActorValue,  // A skill name
-		kActor,       // A placed NPC, or the player
-		kNPC,         // An NPC's base form
-		kFaction,
-		kLocation,
-		kKeyword,
-		kGlobal,
-		kSpell,
-	};
+	// The master files every Skyrim install has, by their load order prefix in FormIDs
+	constexpr std::string_view kMasterFiles[] = { "Skyrim.esm"sv, "Update.esm"sv, "Dawnguard.esm"sv, "HearthFires.esm"sv, "Dragonborn.esm"sv };
 
-	// How each function Mantella sends maps to a game condition function.
-	// subjectIsThis: the condition runs on the subject, and the argument is its first parameter.
-	// Otherwise the condition runs on the player, and subject / argument are its first / second parameter.
-	struct FunctionSpec
-	{
-		std::string_view name;
-		std::string_view command;
-		bool             subjectIsThis;
-		Kind             subject;
-		Kind             argument;
-	};
-
-	constexpr FunctionSpec kFunctions[] = {
-		{ "getstagedone"sv, "GetStageDone"sv, false, Kind::kQuest, Kind::kInt },
-		{ "getquestcompleted"sv, "GetQuestCompleted"sv, false, Kind::kQuest, Kind::kNone },
-		{ "getstage"sv, "GetStage"sv, false, Kind::kQuest, Kind::kNone },
-		{ "getdead"sv, "GetDead"sv, true, Kind::kActor, Kind::kNone },
-		{ "getdeadcount"sv, "GetDeadCount"sv, false, Kind::kNPC, Kind::kNone },
-		{ "getav"sv, "GetBaseActorValue"sv, true, Kind::kActor, Kind::kActorValue },
-		{ "getfactionrank"sv, "GetFactionRank"sv, true, Kind::kActor, Kind::kFaction },
-		{ "getinfaction"sv, "GetInFaction"sv, true, Kind::kActor, Kind::kFaction },
-		{ "getkeyworddataforlocation"sv, "GetKeywordDataForLocation"sv, false, Kind::kLocation, Kind::kKeyword },
-		{ "getglobalvalue"sv, "GetGlobalValue"sv, false, Kind::kGlobal, Kind::kNone },
-		{ "getrelationshiprank"sv, "GetRelationshipRank"sv, true, Kind::kActor, Kind::kActor },
-		{ "ishostiletoactor"sv, "IsHostileToActor"sv, true, Kind::kActor, Kind::kActor },
-		{ "hasspell"sv, "HasSpell"sv, true, Kind::kActor, Kind::kSpell },
-	};
-
-	// The skill names Mantella sends, lowercase (ParseValue lowercases them: Papyrus may hand strings over in another case)
+	// Skill names, lowercase (values are lowercased: Papyrus may hand strings over in another case).
+	// A fixed table: the game's own name lookup doesn't know names like OneHanded or Marksman
 	struct Skill
 	{
 		std::string_view name;
@@ -68,6 +31,7 @@ namespace
 		{ "onehanded"sv, RE::ActorValue::kOneHanded },
 		{ "twohanded"sv, RE::ActorValue::kTwoHanded },
 		{ "marksman"sv, RE::ActorValue::kArchery },
+		{ "archery"sv, RE::ActorValue::kArchery },
 		{ "block"sv, RE::ActorValue::kBlock },
 		{ "smithing"sv, RE::ActorValue::kSmithing },
 		{ "heavyarmor"sv, RE::ActorValue::kHeavyArmor },
@@ -77,6 +41,7 @@ namespace
 		{ "sneak"sv, RE::ActorValue::kSneak },
 		{ "alchemy"sv, RE::ActorValue::kAlchemy },
 		{ "speechcraft"sv, RE::ActorValue::kSpeech },
+		{ "speech"sv, RE::ActorValue::kSpeech },
 		{ "alteration"sv, RE::ActorValue::kAlteration },
 		{ "conjuration"sv, RE::ActorValue::kConjuration },
 		{ "destruction"sv, RE::ActorValue::kDestruction },
@@ -85,28 +50,135 @@ namespace
 		{ "enchanting"sv, RE::ActorValue::kEnchanting },
 	};
 
-	// A subject or argument as Mantella sends it: "player", "File.esm|0D7505", a quest editor ID, a number or a skill name
+	// How a value is read and handed to the condition function
+	enum class Kind
+	{
+		kNumber,      // Passed as a number in the pointer's place
+		kActorValue,  // A skill or other actor value name, passed as its number
+		kQuest,       // Editor ID
+		kReference,   // Anything placed in the world. Can leave memory, so not finding one means "not loaded"
+		kActor,       // A placed NPC, or the player
+		kForm,        // Any other form, always in memory once the game is loaded
+	};
+
+	template <class T>
+	bool Is(RE::TESForm* a_form)
+	{
+		return a_form->As<T>() != nullptr;
+	}
+
+	bool IsInventoryObject(RE::TESForm* a_form) { return a_form->IsInventoryObject(); }
+	bool IsAnyForm(RE::TESForm*) { return true; }
+	bool IsOwner(RE::TESForm* a_form) { return Is<RE::TESFaction>(a_form) || Is<RE::TESNPC>(a_form); }
+
+	struct ParamSpec
+	{
+		Kind kind;
+		bool (*accepts)(RE::TESForm*){ nullptr };  // For kForm: whether a form is the kind the function takes
+	};
+
+	// The parameter types this plugin can read. Others (text, aliases, event data, ...) make the check unreadable
+	std::optional<ParamSpec> GetParamSpec(RE::SCRIPT_PARAM_TYPE a_type)
+	{
+		using Type = RE::SCRIPT_PARAM_TYPE;
+		switch (a_type) {
+		case Type::kInt:
+		case Type::kStage:
+			return ParamSpec{ Kind::kNumber };
+		case Type::kActorValue:
+			return ParamSpec{ Kind::kActorValue };
+		case Type::kQuest:
+			return ParamSpec{ Kind::kQuest };
+		case Type::kObjectRef:
+		case Type::kContainerRef:
+		case Type::kMapMarker:
+			return ParamSpec{ Kind::kReference };
+		case Type::kActor:
+			return ParamSpec{ Kind::kActor };
+		case Type::kInventoryObject:
+			return ParamSpec{ Kind::kForm, IsInventoryObject };
+		case Type::kSpellItem:
+			return ParamSpec{ Kind::kForm, Is<RE::SpellItem> };
+		case Type::kMagicItem:
+			return ParamSpec{ Kind::kForm, Is<RE::MagicItem> };
+		case Type::kCell:
+			return ParamSpec{ Kind::kForm, Is<RE::TESObjectCELL> };
+		case Type::kTopic:
+			return ParamSpec{ Kind::kForm, Is<RE::TESTopic> };
+		case Type::kRace:
+			return ParamSpec{ Kind::kForm, Is<RE::TESRace> };
+		case Type::kClass:
+			return ParamSpec{ Kind::kForm, Is<RE::TESClass> };
+		case Type::kFaction:
+			return ParamSpec{ Kind::kForm, Is<RE::TESFaction> };
+		case Type::kGlobal:
+			return ParamSpec{ Kind::kForm, Is<RE::TESGlobal> };
+		case Type::kActorBase:
+		case Type::kNPC:
+			return ParamSpec{ Kind::kForm, Is<RE::TESNPC> };
+		case Type::kPackage:
+			return ParamSpec{ Kind::kForm, Is<RE::TESPackage> };
+		case Type::kMagicEffect:
+			return ParamSpec{ Kind::kForm, Is<RE::EffectSetting> };
+		case Type::kWeather:
+			return ParamSpec{ Kind::kForm, Is<RE::TESWeather> };
+		case Type::kFormList:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSListForm> };
+		case Type::kPerk:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSPerk> };
+		case Type::kVoiceType:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSVoiceType> };
+		case Type::kIdleForm:
+			return ParamSpec{ Kind::kForm, Is<RE::TESIdleForm> };
+		case Type::kEquipType:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSEquipSlot> };
+		case Type::kKeyword:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSKeyword> };
+		case Type::kRefType:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSLocationRefType> };
+		case Type::kLocation:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSLocation> };
+		case Type::kShout:
+			return ParamSpec{ Kind::kForm, Is<RE::TESShout> };
+		case Type::kWordOfPower:
+			return ParamSpec{ Kind::kForm, Is<RE::TESWordOfPower> };
+		case Type::kAssociationType:
+			return ParamSpec{ Kind::kForm, Is<RE::BGSAssociationType> };
+		case Type::kOwner:
+			return ParamSpec{ Kind::kForm, IsOwner };
+		case Type::kForm:
+			return ParamSpec{ Kind::kForm, IsAnyForm };
+		default:
+			return std::nullopt;
+		}
+	}
+
+	// A reference or value as Mantella sends it, read for the kind of value the function takes
 	struct Value
 	{
-		bool          isPlayer{ false };
-		std::string   file;
+		ParamSpec     spec{ Kind::kNumber };
+		std::string   file;  // For forms: the file and the FormID within it
 		RE::FormID    localID{ 0 };
-		std::string   text;  // Lowercase quest editor ID, or the skill name
-		std::uint32_t number{ 0 };
+		std::string   questEditorID;  // Lowercase
+		std::uint32_t number{ 0 };    // For kNumber and kActorValue
 	};
 
 	struct Check
 	{
-		const FunctionSpec* spec{ nullptr };  // Null when Mantella sent something this plugin can't read
-		Value               subject;
-		Value               argument;
+		RE::SCRIPT_FUNCTION* command{ nullptr };  // Null when the check can't be run
+		bool                 hasReference{ false };
+		Value                reference;  // What the condition runs on; the player when there is none
+		std::size_t          numParams{ 0 };
+		Value                params[2];
+		std::string          text;                // As Mantella sent it, for the log
+		bool                 loggedWrongForm{ false };
 	};
 
-	std::mutex                                                 g_lock;
-	std::string                                                g_version;
-	std::vector<Check>                                         g_checks;
-	std::unordered_map<std::string, RE::FormID>                g_questsByEditorID;  // Lowercase editor ID -> FormID, filled once the game's data is loaded
-	std::unordered_map<std::string_view, RE::SCRIPT_FUNCTION*> g_commands;          // Static game data, filled once the game's data is loaded
+	std::mutex                                                   g_lock;
+	std::string                                                  g_version;
+	std::vector<Check>                                           g_checks;
+	std::unordered_map<std::string, RE::FormID>                  g_questsByEditorID;  // Lowercase editor ID -> FormID, filled once the game's data is loaded
+	std::unordered_map<std::string, RE::SCRIPT_FUNCTION*>        g_conditionFunctions;  // Lowercase long and short names, filled once the game's data is loaded
 
 	std::string ToLower(std::string_view a_text)
 	{
@@ -115,31 +187,73 @@ namespace
 		return result;
 	}
 
-	bool ParseValue(std::string_view a_text, Kind a_kind, Value& a_value)
+	// "player", "File.esm|0D7505", or a FormID as the console shows it ("0D7505", "0201462A": the first two digits pick the master file)
+	bool ParseForm(std::string_view a_text, Value& a_value)
 	{
-		switch (a_kind) {
-		case Kind::kNone:
+		if (ToLower(a_text) == "player") {
+			a_value.file = kMasterFiles[0];
+			a_value.localID = 0x14;
 			return true;
-		case Kind::kQuest:
-		case Kind::kActorValue:
-			a_value.text = ToLower(a_text);
-			return !a_value.text.empty();
-		case Kind::kInt:
-			return std::from_chars(a_text.data(), a_text.data() + a_text.size(), a_value.number).ec == std::errc{};
-		default:
+		}
+		if (const auto separator = a_text.find('|'); separator != std::string_view::npos) {
+			a_value.file = std::string(a_text.substr(0, separator));
+			const auto id = a_text.substr(separator + 1);
+			const auto idEnd = id.data() + id.size();
+			const auto [idPointer, idError] = std::from_chars(id.data(), idEnd, a_value.localID, 16);
+			return !a_value.file.empty() && !id.empty() && idError == std::errc{} && idPointer == idEnd;
+		}
+		RE::FormID formID = 0;
+		const auto end = a_text.data() + a_text.size();
+		const auto [pointer, error] = std::from_chars(a_text.data(), end, formID, 16);
+		const auto loadOrder = formID >> 24;
+		if (a_text.empty() || a_text.size() > 8 || error != std::errc{} || pointer != end || loadOrder >= std::size(kMasterFiles)) {
+			return false;  // A name, or a FormID from a mod: its first two digits depend on each player's load order
+		}
+		a_value.file = kMasterFiles[loadOrder];
+		a_value.localID = formID & 0xFFFFFF;
+		return true;
+	}
+
+	// Reads a value for its kind. Returns why it can't be read, or nothing when it can
+	std::optional<std::string> ParseValue(std::string_view a_text, const ParamSpec& a_spec, Value& a_value)
+	{
+		a_value.spec = a_spec;
+		switch (a_spec.kind) {
+		case Kind::kNumber:
 			{
-				if (ToLower(a_text) == "player") {
-					a_value.isPlayer = true;
-					return true;
+				std::int32_t number = 0;
+				const auto   end = a_text.data() + a_text.size();
+				const auto [pointer, error] = std::from_chars(a_text.data(), end, number);
+				if (error != std::errc{} || pointer != end) {
+					return std::format("'{}' is not a number", a_text);
 				}
-				const auto separator = a_text.find('|');
-				if (separator == std::string_view::npos) {
-					return false;
-				}
-				a_value.file = std::string(a_text.substr(0, separator));
-				const auto id = a_text.substr(separator + 1);
-				return std::from_chars(id.data(), id.data() + id.size(), a_value.localID, 16).ec == std::errc{};
+				a_value.number = static_cast<std::uint32_t>(number);
+				return std::nullopt;
 			}
+		case Kind::kActorValue:
+			{
+				const auto name = ToLower(a_text);
+				if (const auto skill = std::ranges::find(kSkills, std::string_view(name), &Skill::name); skill != std::ranges::end(kSkills)) {
+					a_value.number = static_cast<std::uint32_t>(skill->actorValue);
+					return std::nullopt;
+				}
+				for (std::uint32_t i = 0; i < static_cast<std::uint32_t>(RE::ActorValue::kTotal); ++i) {
+					const char* avName = RE::ActorValueList::GetActorValueName(static_cast<RE::ActorValue>(i));
+					if (avName && ToLower(avName) == name) {
+						a_value.number = i;
+						return std::nullopt;
+					}
+				}
+				return std::format("unknown actor value '{}'", a_text);
+			}
+		case Kind::kQuest:
+			a_value.questEditorID = ToLower(a_text);
+			return a_value.questEditorID.empty() ? std::optional<std::string>("no quest given") : std::nullopt;
+		default:
+			if (!ParseForm(a_text, a_value)) {
+				return std::format("'{}' is not a FormID (names of factions, keywords etc. can't be looked up; mod forms are written Plugin.esp|00ABCD)", a_text);
+			}
+			return std::nullopt;
 		}
 	}
 
@@ -148,155 +262,162 @@ namespace
 		kOK,
 		kMissing,
 		kNotLoaded,
+		kWrongForm,  // A mistake in the condition: the FormID doesn't exist in its file, or is the wrong kind
 	};
 
-	// Looks the form up fresh every time: NPCs who are only loaded nearby can be freed when the player leaves
-	Status LookupForm(const Value& a_value, RE::TESForm*& a_form)
+	// The value as the condition function takes it: a form pointer, or a number in the pointer's place.
+	// Forms are looked up fresh every time: NPCs who are only loaded nearby can be freed when the player leaves
+	Status Resolve(const Value& a_value, void*& a_param)
 	{
-		if (a_value.isPlayer) {
-			a_form = RE::PlayerCharacter::GetSingleton();
-			return a_form ? Status::kOK : Status::kNotLoaded;
+		a_param = nullptr;
+		switch (a_value.spec.kind) {
+		case Kind::kNumber:
+		case Kind::kActorValue:
+			a_param = reinterpret_cast<void*>(static_cast<std::uintptr_t>(a_value.number));
+			return Status::kOK;
+		case Kind::kQuest:
+			{
+				const auto it = g_questsByEditorID.find(a_value.questEditorID);
+				a_param = it != g_questsByEditorID.end() ? RE::TESForm::LookupByID<RE::TESQuest>(it->second) : nullptr;
+				return a_param ? Status::kOK : Status::kMissing;  // No loaded file has a quest by that name
+			}
+		default:
+			break;
 		}
+
 		auto*       dataHandler = RE::TESDataHandler::GetSingleton();
 		const auto* file = dataHandler ? dataHandler->LookupModByName(a_value.file) : nullptr;
 		if (!file || file->compileIndex == 0xFF) {
 			return Status::kMissing;  // The mod isn't installed
 		}
-		a_form = dataHandler->LookupForm(a_value.localID, a_value.file);
-		return a_form ? Status::kOK : Status::kNotLoaded;
-	}
-
-	// The value as the condition function takes it: a form pointer, or a number in the pointer's place
-	Status Resolve(const Value& a_value, Kind a_kind, void*& a_param)
-	{
-		a_param = nullptr;
-		switch (a_kind) {
-		case Kind::kNone:
-			return Status::kOK;
-		case Kind::kInt:
-			a_param = reinterpret_cast<void*>(static_cast<std::uintptr_t>(a_value.number));
-			return Status::kOK;
-		case Kind::kActorValue:
-			{
-				// A fixed table: the game's own name lookup doesn't know names like OneHanded or Marksman
-				const auto skill = std::ranges::find(kSkills, std::string_view(a_value.text), &Skill::name);
-				if (skill == std::ranges::end(kSkills)) {
-					return Status::kMissing;
-				}
-				a_param = reinterpret_cast<void*>(static_cast<std::uintptr_t>(skill->actorValue));
-				return Status::kOK;
-			}
-		case Kind::kQuest:
-			{
-				const auto it = g_questsByEditorID.find(a_value.text);
-				auto*      quest = it != g_questsByEditorID.end() ? RE::TESForm::LookupByID<RE::TESQuest>(it->second) : nullptr;
-				if (!quest) {
-					return Status::kMissing;
-				}
-				a_param = quest;
-				return Status::kOK;
-			}
-		default:
-			break;
+		auto* form = dataHandler->LookupForm(a_value.localID, a_value.file);
+		const bool isPlaced = a_value.spec.kind == Kind::kReference || a_value.spec.kind == Kind::kActor;
+		if (!form) {
+			// Only placed things leave memory. Base NPCs, factions, places etc. are always loaded, so not finding one is a wrong ID
+			return isPlaced ? Status::kNotLoaded : Status::kWrongForm;
 		}
-
-		RE::TESForm* form = nullptr;
-		if (const auto status = LookupForm(a_value, form); status != Status::kOK) {
-			// Only placed NPCs leave memory. Base NPCs, factions, places etc. are always loaded, so not finding one is a wrong ID
-			return status == Status::kNotLoaded && a_kind != Kind::kActor ? Status::kMissing : status;
-		}
-		// The wrong kind of form means a mistake in the condition: not true
-		switch (a_kind) {
+		switch (a_value.spec.kind) {
 		case Kind::kActor:
 			if (auto* actor = form->As<RE::Actor>()) {
 				a_param = static_cast<RE::TESObjectREFR*>(actor);
 			}
 			break;
-		case Kind::kNPC:
-			a_param = form->As<RE::TESNPC>();
-			break;
-		case Kind::kFaction:
-			a_param = form->As<RE::TESFaction>();
-			break;
-		case Kind::kLocation:
-			a_param = form->As<RE::BGSLocation>();
-			break;
-		case Kind::kKeyword:
-			a_param = form->As<RE::BGSKeyword>();
-			break;
-		case Kind::kGlobal:
-			a_param = form->As<RE::TESGlobal>();
-			break;
-		case Kind::kSpell:
-			a_param = form->As<RE::SpellItem>();
+		case Kind::kReference:
+			a_param = form->AsReference();
 			break;
 		default:
+			if (a_value.spec.accepts(form)) {
+				a_param = form;
+			}
 			break;
 		}
-		return a_param ? Status::kOK : Status::kMissing;
+		return a_param ? Status::kOK : Status::kWrongForm;
 	}
 
-	float Answer(const Check& a_check)
+	float Answer(Check& a_check)
 	{
-		if (!a_check.spec) {
+		if (!a_check.command) {
+			return kAnswerUnreadable;
+		}
+		void*  values[3]{};  // The reference, then the parameters
+		Status statuses[3]{ Status::kOK, Status::kOK, Status::kOK };
+		if (a_check.hasReference) {
+			statuses[0] = Resolve(a_check.reference, values[0]);
+		}
+		for (std::size_t i = 0; i < a_check.numParams; ++i) {
+			statuses[i + 1] = Resolve(a_check.params[i], values[i + 1]);
+		}
+		if (std::ranges::find(statuses, Status::kWrongForm) != std::ranges::end(statuses)) {
+			if (!a_check.loggedWrongForm) {
+				a_check.loggedWrongForm = true;
+				logs::warn("Can't run {}: a FormID doesn't exist in its file, or isn't the kind {} takes", a_check.text, a_check.command->functionName);
+			}
+			return kAnswerUnreadable;
+		}
+		if (std::ranges::find(statuses, Status::kMissing) != std::ranges::end(statuses)) {
 			return kAnswerMissing;
 		}
-		const auto command = g_commands.find(a_check.spec->name);
-		if (command == g_commands.end() || !command->second || !command->second->conditionFunction) {
-			return kAnswerMissing;
-		}
-
-		void*      subject = nullptr;
-		void*      argument = nullptr;
-		const auto subjectStatus = Resolve(a_check.subject, a_check.spec->subject, subject);
-		const auto argumentStatus = Resolve(a_check.argument, a_check.spec->argument, argument);
-		if (subjectStatus == Status::kMissing || argumentStatus == Status::kMissing) {
-			return kAnswerMissing;
-		}
-		if (subjectStatus == Status::kNotLoaded || argumentStatus == Status::kNotLoaded) {
+		if (std::ranges::find(statuses, Status::kNotLoaded) != std::ranges::end(statuses)) {
 			return kAnswerNotLoaded;
 		}
 
-		RE::TESObjectREFR* thisObject = RE::PlayerCharacter::GetSingleton();
-		void*              param1 = subject;
-		void*              param2 = argument;
-		if (a_check.spec->subjectIsThis) {
-			thisObject = static_cast<RE::TESObjectREFR*>(subject);
-			param1 = argument;
-			param2 = nullptr;
-		}
+		auto* thisObject = a_check.hasReference ? static_cast<RE::TESObjectREFR*>(values[0]) : RE::PlayerCharacter::GetSingleton();
 		if (!thisObject) {
 			return kAnswerNotLoaded;
 		}
 		double result = 0.0;
-		command->second->conditionFunction(thisObject, param1, param2, result);
+		a_check.command->conditionFunction(thisObject, values[1], values[2], result);
 		return static_cast<float>(result);
 	}
 
-	bool SetCheckList(RE::StaticFunctionTag*, std::string a_version, std::vector<std::string> a_functions, std::vector<std::string> a_subjects, std::vector<std::string> a_arguments)
+	// Reads one check of the list. Returns why it can't be run, or nothing when it can
+	std::optional<std::string> ReadCheck(std::string_view a_function, std::string_view a_reference, std::string_view a_param1, std::string_view a_param2, Check& a_check)
 	{
-		if (a_subjects.size() != a_functions.size() || a_arguments.size() != a_functions.size()) {
-			logs::warn("SetCheckList: {} functions, {} subjects, {} arguments - ignoring the list", a_functions.size(), a_subjects.size(), a_arguments.size());
+		const auto it = g_conditionFunctions.find(ToLower(a_function));
+		if (it == g_conditionFunctions.end()) {
+			return "not one of the game's condition functions"s;
+		}
+		auto* command = it->second;
+
+		if (!a_reference.empty()) {
+			a_check.hasReference = true;
+			if (auto error = ParseValue(a_reference, ParamSpec{ Kind::kReference }, a_check.reference)) {
+				return error;
+			}
+		}
+
+		const std::string_view given[] = { a_param1, a_param2 };
+		a_check.numParams = a_param2.empty() ? (a_param1.empty() ? 0 : 1) : 2;
+		if (a_param1.empty() && !a_param2.empty()) {
+			return "a second value without a first"s;
+		}
+		std::size_t required = 0;
+		for (std::size_t i = 0; i < command->numParams; ++i) {
+			if (!command->params[i].optional) {
+				++required;
+			}
+		}
+		if (a_check.numParams < required || a_check.numParams > command->numParams) {
+			return std::format("{} takes {} value(s), got {}", command->functionName, command->numParams, a_check.numParams);
+		}
+		for (std::size_t i = 0; i < a_check.numParams; ++i) {
+			const auto type = command->params[i].paramType.get();
+			const auto spec = GetParamSpec(type);
+			if (!spec) {
+				return std::format("{} value {} has a kind this plugin can't read (parameter type {})", command->functionName, i + 1, std::to_underlying(type));
+			}
+			if (auto error = ParseValue(given[i], *spec, a_check.params[i])) {
+				return error;
+			}
+		}
+		a_check.command = command;
+		return std::nullopt;
+	}
+
+	bool SetCheckList(RE::StaticFunctionTag*, std::string a_version, std::vector<std::string> a_functions, std::vector<std::string> a_references, std::vector<std::string> a_params1, std::vector<std::string> a_params2)
+	{
+		const auto count = a_functions.size();
+		if (a_references.size() != count || a_params1.size() != count || a_params2.size() != count) {
+			logs::warn("SetCheckList: {} functions, {} references, {} first values, {} second values - ignoring the list", count, a_references.size(), a_params1.size(), a_params2.size());
 			return false;
 		}
-		std::vector<Check> checks(a_functions.size());
+		std::vector<Check> checks(count);
 		std::size_t        unreadable = 0;
-		for (std::size_t i = 0; i < a_functions.size(); ++i) {
-			const auto name = ToLower(a_functions[i]);
-			const auto spec = std::ranges::find(kFunctions, std::string_view(name), &FunctionSpec::name);
-			auto&      check = checks[i];
-			if (spec == std::ranges::end(kFunctions) || !ParseValue(a_subjects[i], spec->subject, check.subject) || !ParseValue(a_arguments[i], spec->argument, check.argument)) {
-				logs::warn("Can't read check {}: {} {} {}", i, a_functions[i], a_subjects[i], a_arguments[i]);
+		for (std::size_t i = 0; i < count; ++i) {
+			const auto reference = a_references[i].empty() ? ""s : std::format("\"{}\".", a_references[i]);
+			const auto text = std::format("check {}: {}{} {} {}", i, reference, a_functions[i], a_params1[i], a_params2[i]);
+			if (auto error = ReadCheck(a_functions[i], a_references[i], a_params1[i], a_params2[i], checks[i])) {
+				logs::warn("Can't run {} ({})", text, *error);
+				checks[i] = Check{};
 				++unreadable;
-				continue;
 			}
-			check.spec = spec;
+			checks[i].text = text;
 		}
 
 		std::scoped_lock lock(g_lock);
 		g_checks = std::move(checks);
 		g_version = std::move(a_version);
-		logs::info("Received check list {} with {} checks ({} unreadable)", g_version, g_checks.size(), unreadable);
+		logs::info("Received check list {} with {} checks ({} can't be run)", g_version, g_checks.size(), unreadable);
 		return true;
 	}
 
@@ -312,7 +433,7 @@ namespace
 		std::scoped_lock   lock(g_lock);
 		std::vector<float> answers;
 		answers.reserve(g_checks.size());
-		for (const auto& check : g_checks) {
+		for (auto& check : g_checks) {
 			answers.push_back(Answer(check));
 		}
 		return answers;
@@ -329,15 +450,20 @@ namespace
 
 	void OnDataLoaded()
 	{
-		for (const auto& spec : kFunctions) {
-			auto* command = RE::SCRIPT_FUNCTION::LocateScriptCommand(spec.command);
-			if (!command || !command->conditionFunction) {
-				logs::error("Condition function {} not found", spec.command);
-			}
-			g_commands[spec.name] = command;
-		}
-
 		std::scoped_lock lock(g_lock);
+		auto*            commands = RE::SCRIPT_FUNCTION::GetFirstScriptCommand();
+		// Long names first, so a short name that matches another command's long name never takes its place
+		for (const bool longNames : { true, false }) {
+			for (std::uint32_t i = 0; i < RE::SCRIPT_FUNCTION::Commands::kScriptCommandsEnd; ++i) {
+				auto&       command = commands[i];
+				const char* name = longNames ? command.functionName : command.shortName;
+				if (command.conditionFunction && name && name[0]) {
+					g_conditionFunctions.emplace(ToLower(name), &command);
+				}
+			}
+		}
+		logs::info("Found {} condition function names", g_conditionFunctions.size());
+
 		if (auto* dataHandler = RE::TESDataHandler::GetSingleton()) {
 			for (const auto* quest : dataHandler->GetFormArray<RE::TESQuest>()) {
 				const char* editorID = quest ? quest->GetFormEditorID() : nullptr;
