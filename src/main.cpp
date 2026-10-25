@@ -68,6 +68,8 @@ namespace
 	}
 
 	bool IsInventoryObject(RE::TESForm* a_form) { return a_form->IsInventoryObject(); }
+	bool IsInventoryObjectOrList(RE::TESForm* a_form) { return a_form->IsInventoryObject() || Is<RE::BGSListForm>(a_form); }
+	bool IsObjectOrList(RE::TESForm* a_form) { return a_form->IsBoundObject() || Is<RE::BGSListForm>(a_form); }
 	bool IsAnyForm(RE::TESForm*) { return true; }
 	bool IsOwner(RE::TESForm* a_form) { return Is<RE::TESFaction>(a_form) || Is<RE::TESNPC>(a_form); }
 
@@ -97,6 +99,10 @@ namespace
 			return ParamSpec{ Kind::kActor };
 		case Type::kInventoryObject:
 			return ParamSpec{ Kind::kForm, IsInventoryObject };
+		case Type::kInvObjectOrFormList:
+			return ParamSpec{ Kind::kForm, IsInventoryObjectOrList };
+		case Type::kObjectOrFormList:
+			return ParamSpec{ Kind::kForm, IsObjectOrList };
 		case Type::kSpellItem:
 			return ParamSpec{ Kind::kForm, Is<RE::SpellItem> };
 		case Type::kMagicItem:
