@@ -18,6 +18,10 @@ Float[] Function Evaluate() Global Native
 
 `Evaluate` returns one number per check. Two reserved values mark a check whose subject doesn't exist in this game (`-9999901`) or isn't loaded right now, such as an NPC far away (`-9999902`).
 
+## Script variables
+
+`GetVMQuestVariable <quest> <name>` and `GetVMScriptVariable <reference> <name>` are answered by reading the variable from the scripts attached to the quest or reference, not by the game's condition function. The name can be the variable (`::CityToSwitch_var`) or the property (`CityToSwitch`). Int, Float and Bool variables are answered as numbers. A name no attached script has answers `-9999903` (the check can't be run) and is logged once.
+
 ## Building
 
 The DLL is built by GitHub Actions on every push (`.github/workflows/build.yml`); download it from the run's Artifacts. To build locally you need VS 2022 with the C++ workload and [xmake](https://xmake.io) 3.0+:

@@ -59,6 +59,7 @@ namespace
 		kReference,   // Anything placed in the world. Can leave memory, so not finding one means "not loaded"
 		kActor,       // A placed NPC, or the player
 		kForm,        // Any other form, always in memory once the game is loaded
+		kScriptVariable,  // The name of a variable of a script, e.g. ::CityToSwitch_var. Read by this plugin, not by the game's function
 	};
 
 	template <class T>
@@ -79,7 +80,7 @@ namespace
 		bool (*accepts)(RE::TESForm*){ nullptr };  // For kForm: whether a form is the kind the function takes
 	};
 
-	// The parameter types this plugin can read. Others (text, aliases, event data, ...) make the check unreadable
+	// The parameter types this plugin can read. Others (other text, aliases, event data, ...) make the check unreadable
 	std::optional<ParamSpec> GetParamSpec(RE::SCRIPT_PARAM_TYPE a_type)
 	{
 		using Type = RE::SCRIPT_PARAM_TYPE;
@@ -154,6 +155,8 @@ namespace
 			return ParamSpec{ Kind::kForm, IsOwner };
 		case Type::kForm:
 			return ParamSpec{ Kind::kForm, IsAnyForm };
+		case Type::kVMScriptVar:
+			return ParamSpec{ Kind::kScriptVariable };
 		default:
 			return std::nullopt;
 		}
@@ -167,6 +170,7 @@ namespace
 		RE::FormID    localID{ 0 };
 		std::string   questEditorID;  // Lowercase
 		std::uint32_t number{ 0 };    // For kNumber and kActorValue
+		std::string   variableName;   // For kScriptVariable
 	};
 
 	struct Check
@@ -177,7 +181,7 @@ namespace
 		std::size_t          numParams{ 0 };
 		Value                params[2];
 		std::string          text;                // As Mantella sent it, for the log
-		bool                 loggedWrongForm{ false };
+		bool                 loggedMistake{ false };  // A mistake found while answering is logged once
 	};
 
 	std::mutex                                                   g_lock;
@@ -255,6 +259,9 @@ namespace
 		case Kind::kQuest:
 			a_value.questEditorID = ToLower(a_text);
 			return a_value.questEditorID.empty() ? std::optional<std::string>("no quest given") : std::nullopt;
+		case Kind::kScriptVariable:
+			a_value.variableName = std::string(a_text);
+			return std::nullopt;
 		default:
 			if (!ParseForm(a_text, a_value)) {
 				return std::format("'{}' is not a FormID (names of factions, keywords etc. can't be looked up; mod forms are written Plugin.esp|00ABCD)", a_text);
@@ -281,6 +288,8 @@ namespace
 		case Kind::kActorValue:
 			a_param = reinterpret_cast<void*>(static_cast<std::uintptr_t>(a_value.number));
 			return Status::kOK;
+		case Kind::kScriptVariable:
+			return Status::kOK;  // Looked up by name when the check is answered
 		case Kind::kQuest:
 			{
 				const auto it = g_questsByEditorID.find(a_value.questEditorID);
@@ -320,6 +329,64 @@ namespace
 		return a_param ? Status::kOK : Status::kWrongForm;
 	}
 
+	// The value of a variable of a script attached to a quest or a placed thing (GetVMQuestVariable, GetVMScriptVariable).
+	// Read straight from the script: the variable is looked up by name in every script attached to the form,
+	// first as given (::CityToSwitch_var), then as the variable behind a property of that name (CityToSwitch).
+	// A name no attached script has is a mistake in the condition, where the game's own function would answer 0
+	float AnswerScriptVariable(Check& a_check, const RE::TESForm* a_form)
+	{
+		auto* vm = RE::BSScript::Internal::VirtualMachine::GetSingleton();
+		auto* handlePolicy = vm ? vm->handlePolicy : nullptr;
+		if (!handlePolicy) {
+			return kAnswerNotLoaded;
+		}
+		const auto&             name = a_check.params[1].variableName;
+		const RE::BSFixedString asGiven(name.c_str());
+		const RE::BSFixedString asProperty(std::format("::{}_var", name).c_str());
+		const auto              handle = handlePolicy->GetHandleForObject(a_form->GetFormType(), a_form);
+		std::optional<float>    answer;
+		bool                    found = false;
+		{
+			RE::BSSpinLockGuard locker(vm->attachedScriptsLock);
+			if (const auto it = vm->attachedScripts.find(handle); it != vm->attachedScripts.end()) {
+				for (const auto& script : it->second) {
+					const RE::BSScript::Object* object = script.get();
+					if (!object) {
+						continue;
+					}
+					const auto* variable = object->GetVariable(asGiven);
+					if (!variable) {
+						variable = object->GetVariable(asProperty);
+					}
+					if (!variable) {
+						continue;
+					}
+					found = true;
+					if (variable->IsInt()) {
+						answer = static_cast<float>(variable->GetSInt());
+					} else if (variable->IsFloat()) {
+						answer = variable->GetFloat();
+					} else if (variable->IsBool()) {
+						answer = variable->GetBool() ? 1.0f : 0.0f;
+					}
+					break;
+				}
+			}
+		}
+		if (answer) {
+			return *answer;
+		}
+		if (!a_check.loggedMistake) {
+			a_check.loggedMistake = true;
+			if (found) {
+				logs::warn("Can't run {}: the variable '{}' isn't a number or true/false", a_check.text, name);
+			} else {
+				logs::warn("Can't run {}: no script attached to it has a variable '{}' (write it as the game shows it, e.g. ::CityToSwitch_var, or as the property name, e.g. CityToSwitch)", a_check.text, name);
+			}
+		}
+		return kAnswerUnreadable;
+	}
+
 	float Answer(Check& a_check)
 	{
 		if (!a_check.command) {
@@ -334,8 +401,8 @@ namespace
 			statuses[i + 1] = Resolve(a_check.params[i], values[i + 1]);
 		}
 		if (std::ranges::find(statuses, Status::kWrongForm) != std::ranges::end(statuses)) {
-			if (!a_check.loggedWrongForm) {
-				a_check.loggedWrongForm = true;
+			if (!a_check.loggedMistake) {
+				a_check.loggedMistake = true;
 				logs::warn("Can't run {}: a FormID doesn't exist in its file, or isn't the kind {} takes", a_check.text, a_check.command->functionName);
 			}
 			return kAnswerUnreadable;
@@ -345,6 +412,14 @@ namespace
 		}
 		if (std::ranges::find(statuses, Status::kNotLoaded) != std::ranges::end(statuses)) {
 			return kAnswerNotLoaded;
+		}
+
+		if (a_check.numParams == 2 && a_check.params[1].spec.kind == Kind::kScriptVariable) {
+			// ReadCheck made sure the first value is a quest or something placed in the world
+			const RE::TESForm* form = a_check.params[0].spec.kind == Kind::kQuest ?
+			                              static_cast<const RE::TESForm*>(static_cast<RE::TESQuest*>(values[1])) :
+			                              static_cast<const RE::TESForm*>(static_cast<RE::TESObjectREFR*>(values[1]));
+			return AnswerScriptVariable(a_check, form);
 		}
 
 		auto* thisObject = a_check.hasReference ? static_cast<RE::TESObjectREFR*>(values[0]) : RE::PlayerCharacter::GetSingleton();
@@ -394,6 +469,12 @@ namespace
 			}
 			if (auto error = ParseValue(given[i], *spec, a_check.params[i])) {
 				return error;
+			}
+			if (spec->kind == Kind::kScriptVariable) {
+				const auto owner = i == 1 ? a_check.params[0].spec.kind : Kind::kScriptVariable;
+				if (owner != Kind::kQuest && owner != Kind::kReference && owner != Kind::kActor) {
+					return std::format("{} takes a script variable in a way this plugin can't read", command->functionName);
+				}
 			}
 		}
 		a_check.command = command;
